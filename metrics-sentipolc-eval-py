@@ -1,0 +1,249 @@
+from datetime import datetime, timedelta
+import json
+import os
+import sys
+import time
+from google.colab import drive
+from IPython.display import clear_output
+from sklearn.metrics import accuracy_score, f1_score
+
+# ==============================================================================
+# 1. MONTAGGIO DRIVE E CONFIGURAZIONE PERCORSI
+# ==============================================================================
+
+drive.mount("/content/drive", force_remount=False)
+
+DRIVE_DIR = "/content/drive/MyDrive/sentipolc_eval"
+FILE_PREFIX = "checkpoint-fmt2-"
+POLLING_INTERVAL_SECONDS = 300
+MONITOR_SESSION_START_TIME = time.time()
+
+# Tracciamento atomico del contatore di record all'avvio del monitoraggio
+initial_checkpoint_counts = {}
+
+# ==============================================================================
+# 2. CALCOLO METRICHE E ETA DINAMICO
+# ==============================================================================
+
+
+def calculate_metrics(results_list: list) -> dict:
+  valid = [
+      r
+      for r in results_list
+      if r.get("status") == "ok" and r.get("pred_opos") is not None
+  ]
+  if not valid:
+    return {
+        "acc_pos": 0.0,
+        "acc_neg": 0.0,
+        "f1_pos": 0.0,
+        "f1_neg": 0.0,
+        "combined": 0.0,
+    }
+
+  y_true_pos = [int(r["target_opos"]) for r in valid]
+  y_pred_pos = [int(r["pred_opos"]) for r in valid]
+
+  neg_key = "target_oneg" if "target_oneg" in valid[0] else "target_neg"
+  y_true_neg = [int(r[neg_key]) for r in valid]
+  y_pred_neg = [int(r["pred_oneg"]) for r in valid]
+
+  acc_pos = accuracy_score(y_true_pos, y_pred_pos) * 100
+  acc_neg = accuracy_score(y_true_neg, y_pred_neg) * 100
+  f1_pos = f1_score(y_true_pos, y_pred_pos, average="macro")
+  f1_neg = f1_score(y_true_neg, y_pred_neg, average="macro")
+
+  return {
+      "acc_pos": acc_pos,
+      "acc_neg": acc_neg,
+      "f1_pos": f1_pos,
+      "f1_neg": f1_neg,
+      "combined": (f1_pos + f1_neg) / 2.0,
+  }
+
+
+def compute_eta(
+    total_records,
+    completed_records,
+    session_done,
+    session_elapsed,
+    avg_latency,
+):
+  if completed_records >= total_records:
+    return "-", "Completato"
+
+  if session_done > 0 and session_elapsed > 0:
+    sec_per_item = session_elapsed / session_done
+  elif avg_latency > 0:
+    sec_per_item = avg_latency
+  else:
+    return "-", "Calcolo..."
+
+  rem_seconds = (total_records - completed_records) * sec_per_item
+  now = datetime.now()
+  eta_time = now + timedelta(seconds=rem_seconds)
+
+  days_diff = (eta_time.date() - now.date()).days
+  day_suffix = f" (+{days_diff}d)" if days_diff > 0 else ""
+
+  return f"{sec_per_item:.1f}s", eta_time.strftime("%H:%M") + day_suffix
+
+
+# ==============================================================================
+# 3. MOTORE DI SCANSIONE RIGIDO SUI SOLI FILE FMT2
+# ==============================================================================
+
+
+def inspect_fmt2_checkpoints() -> list:
+  """Scansiona la directory ed estrae metadati esclusivamente dai file checkpoint-fmt2-*.json."""
+  if not os.path.exists(DRIVE_DIR):
+    return []
+
+  experiments = []
+  fmt2_files = [
+      f
+      for f in os.listdir(DRIVE_DIR)
+      if f.startswith(FILE_PREFIX) and f.endswith(".json")
+  ]
+
+  for filename in fmt2_files:
+    filepath = os.path.join(DRIVE_DIR, filename)
+    try:
+      with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+      meta = data["metadata"]
+      model_info = meta["model"]
+      protocol_info = meta["protocol"]
+      dataset_info = meta["dataset"]
+
+      results = data.get("results", [])
+      completed_ok = len([r for r in results if r.get("status") == "ok"])
+
+      experiments.append({
+          "file_key": filename,
+          "provider": str(model_info.get("provider", "UNKNOWN")).upper(),
+          "model_id": str(model_info.get("model_id", "Unknown Model")),
+          "mode": str(protocol_info.get("mode", "Unknown Mode")),
+          "total_records": dataset_info.get("total_records", 1998),
+          "completed_ok": completed_ok,
+          "results": results,
+      })
+    except Exception:
+      continue
+
+  # Ordina per Modello, Modalità e Provider
+  experiments.sort(key=lambda x: (x["model_id"], x["mode"], x["provider"]))
+  return experiments
+
+
+def render_dashboard():
+  session_elapsed = time.time() - MONITOR_SESSION_START_TIME
+  experiments = inspect_fmt2_checkpoints()
+
+  clear_output(wait=True)
+  border = "-" * 170
+  print(border)
+  print(
+      f"| DASHBOARD BENCHMARK SentiPOLC 2016 (Filtro: {FILE_PREFIX}*.json)"
+      .ljust(169)
+      + "|"
+  )
+  print(border)
+  print(
+      f"| {'Modello':<28} | {'Modalita':<22} | {'Stato':<16} |"
+      f" {'Progresso':<10} | {'Acc opos':<8} | {'Acc oneg':<8} | {'F1 opos':<7} |"
+      f" {'F1 oneg':<7} | {'Combined F1':<11} | {'Sec/Tw':<7} | {'ETA':<12} |"
+      f" {'Provider':<10} |"
+  )
+  print(border)
+
+  if not experiments:
+    print(
+        f"| Nessun checkpoint valido con prefisso '{FILE_PREFIX}' trovato in"
+        f" {DRIVE_DIR}".ljust(169)
+        + "|"
+    )
+    print(border)
+    return
+
+  for exp in experiments:
+    key = exp["file_key"]
+    total = exp["total_records"]
+    completed = exp["completed_ok"]
+
+    if key not in initial_checkpoint_counts:
+      initial_checkpoint_counts[key] = completed
+
+    session_done = completed - initial_checkpoint_counts[key]
+
+    if completed == total:
+      status_str = "COMPLETATO"
+    elif completed > 0:
+      pct = (completed / total) * 100
+      status_str = f"In corso ({pct:.1f}%)"
+    else:
+      status_str = "Non avviato"
+
+    progress_str = f"{completed}/{total}"
+
+    if completed > 0:
+      m = calculate_metrics(exp["results"])
+      acc_pos_str = f"{m['acc_pos']:.2f}%"
+      acc_neg_str = f"{m['acc_neg']:.2f}%"
+      f1_pos_str = f"{m['f1_pos']:.4f}"
+      f1_neg_str = f"{m['f1_neg']:.4f}"
+      comb_f1_str = f"{m['combined']:.4f}"
+    else:
+      acc_pos_str, acc_neg_str, f1_pos_str, f1_neg_str, comb_f1_str = (
+          "-",
+          "-",
+          "-",
+          "-",
+          "-",
+      )
+
+    latencies = [
+        r.get("latency_seconds", 0.0)
+        for r in exp["results"]
+        if r.get("latency_seconds", 0.0) > 0
+    ]
+    avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
+
+    if status_str.startswith("In corso"):
+      sec_tw_str, eta_str = compute_eta(
+          total, completed, session_done, session_elapsed, avg_lat
+      )
+    elif status_str == "COMPLETATO":
+      sec_tw_str, eta_str = "-", "Done"
+    else:
+      sec_tw_str, eta_str = "-", "-"
+
+    print(
+        f"| {exp['model_id'][:28]:<28} | {exp['mode']:<22} |"
+        f" {status_str:<16} | {progress_str:<10} | {acc_pos_str:>8} |"
+        f" {acc_neg_str:>8} | {f1_pos_str:>7} | {f1_neg_str:>7} |"
+        f" {comb_f1_str:>11} | {sec_tw_str:>7} | {eta_str:>12} |"
+        f" {exp['provider']:<10} |"
+    )
+
+  print(border)
+  print(
+      f"| Ultima scansione disco: {datetime.now().strftime('%H:%M:%S')} |"
+      f" Esperimenti FMT2 attivi: {len(experiments)}".ljust(169)
+      + "|"
+  )
+  print(border)
+
+
+# ==============================================================================
+# 4. LOOP PRINCIPALE
+# ==============================================================================
+
+if __name__ == "__main__":
+  try:
+    while True:
+      render_dashboard()
+      time.sleep(POLLING_INTERVAL_SECONDS)
+  except KeyboardInterrupt:
+    print("\n👋 Monitor arrestato dall'utente.")
